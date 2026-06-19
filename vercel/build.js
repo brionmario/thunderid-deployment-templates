@@ -146,20 +146,36 @@ async function main() {
 
   fs.unlinkSync(zipPath);
 
-  // Patch bootstrap script — Vercel's build environment also lacks /dev/fd,
-  // so bash process substitution (<(...)) fails. Replace with temp-file equivalents.
+  // /dev/fd is needed by bash process substitution (<(...)).
+  // Try to create it as a symlink to /proc/self/fd (works if /dev is writable).
+  // If that fails, fall back to patching bootstrap scripts directly.
+  const devFdOk = fs.existsSync('/dev/fd');
+  console.log(`/dev/fd: ${devFdOk ? 'present' : 'missing'}, /proc/self/fd: ${fs.existsSync('/proc/self/fd') ? 'present' : 'missing'}`);
+  if (!devFdOk) {
+    try {
+      execSync('ln -sf /proc/self/fd /dev/fd', { stdio: 'pipe' });
+      console.log('Created /dev/fd -> /proc/self/fd');
+    } catch (e) {
+      console.log('Could not create /dev/fd:', e.message.split('\n')[0]);
+    }
+  }
+
+  // Patch bootstrap script — replace bash process substitution with temp-file reads.
+  // Runs regardless of /dev/fd status as a belt-and-suspenders fix.
   const bootstrapScript = path.join(OUT_DIR, 'bootstrap', '01-default-resources.sh');
   if (fs.existsSync(bootstrapScript)) {
-    const PSUB = `done < <(echo "$BODY" | grep -o '{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}')`;
-    const WHILE = 'while IFS= read -r line; do';
     let src = fs.readFileSync(bootstrapScript, 'utf8');
-    if (src.includes(PSUB)) {
-      src = src.split(PSUB).join('done < /tmp/_thunder_psub');
-      src = src.split(WHILE).join(
-        `echo "$BODY" | grep -o '{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}' > /tmp/_thunder_psub\n` + WHILE
-      );
+    const MARKER = 'done < <(echo "$BODY"';
+    console.log(`Bootstrap script process substitution present: ${src.includes(MARKER)}`);
+    if (src.includes(MARKER)) {
+      // Replace each: done < <(echo "$BODY" | grep -o '...')
+      // With:         done < /tmp/_thunder_psub
+      src = src.replace(/done < <\(echo "\$BODY"[^)]+\)/g, 'done < /tmp/_thunder_psub');
+      // Insert temp-file population before each matching while loop
+      src = src.replace(/while IFS= read -r line; do/g,
+        'echo "$BODY" | grep -o \'{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}\' > /tmp/_thunder_psub\nwhile IFS= read -r line; do');
       fs.writeFileSync(bootstrapScript, src);
-      console.log('Patched bootstrap/01-default-resources.sh for process substitution compatibility');
+      console.log('Patched 01-default-resources.sh (replaced process substitution with temp files)');
     }
   }
 
