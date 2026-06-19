@@ -146,8 +146,24 @@ async function main() {
 
   fs.unlinkSync(zipPath);
 
+  // Patch bootstrap script — Vercel's build environment also lacks /dev/fd,
+  // so bash process substitution (<(...)) fails. Replace with temp-file equivalents.
+  const bootstrapScript = path.join(OUT_DIR, 'bootstrap', '01-default-resources.sh');
+  if (fs.existsSync(bootstrapScript)) {
+    const PSUB = `done < <(echo "$BODY" | grep -o '{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}')`;
+    const WHILE = 'while IFS= read -r line; do';
+    let src = fs.readFileSync(bootstrapScript, 'utf8');
+    if (src.includes(PSUB)) {
+      src = src.split(PSUB).join('done < /tmp/_thunder_psub');
+      src = src.split(WHILE).join(
+        `echo "$BODY" | grep -o '{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}' > /tmp/_thunder_psub\n` + WHILE
+      );
+      fs.writeFileSync(bootstrapScript, src);
+      console.log('Patched bootstrap/01-default-resources.sh for process substitution compatibility');
+    }
+  }
+
   // Run setup at build time so the function only needs to start the server.
-  // The Vercel build machine is full Linux — bash process substitution works fine here.
   console.log('Running ThunderID setup (build-time)...');
   const setupYaml = DEPLOYMENT_YAML
     .replace(/__PUBLIC_URL__/g, 'http://localhost:8090')
