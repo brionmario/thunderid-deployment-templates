@@ -45,6 +45,9 @@ function makeExecutable(dir) {
 let status = 'idle'; // idle | starting | ready | failed
 let startError = '';
 let resolvedPublicUrl = '';
+// The redirect URI that was registered in the database at build time.
+// If it differs from the runtime Vercel URL, the proxy rewrites OIDC params.
+let registeredConsoleUri = '';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function isPortOpen(port) {
@@ -163,20 +166,35 @@ consent:
       fs.writeFileSync(REPO_CONF, repoConfYaml);
       console.log('[thunderid] Wrote runtime repository/conf/deployment.yaml');
 
-      // 4. Update the Console application's redirect URI in configdb.db.
-      //    During build-time setup, the redirect URI was registered as
-      //    https://localhost:8090/console. At runtime on Vercel, the browser
-      //    sends the Vercel URL as redirect_uri, which causes an OIDC mismatch.
-      //    We patch the stored URI before ThunderID starts so it validates correctly.
+      // 4. Determine the redirect URI that was registered at build time and update if possible.
+      //    setup.sh registered based on PUBLIC_URL. Old builds used https://localhost:8090;
+      //    new builds (with VERCEL_PROJECT_PRODUCTION_URL) use the Vercel URL directly.
+      //    Read the setup URL from the config file written by build.js, or fall back to localhost.
       const dbPath = path.join(WORK_DIR, 'repository', 'database', 'configdb.db');
-      if (fs.existsSync(dbPath) && publicUrl !== 'https://localhost:8090') {
-        const runtimeUri = `${publicUrl}/console`;
-        const sql = `UPDATE OAUTH_INBOUND_PROFILE SET OAUTH_CONFIG = json_set(OAUTH_CONFIG, '$.redirectUris[0]', '${runtimeUri}') WHERE json_extract(OAUTH_CONFIG, '$.clientId') = 'CONSOLE';`;
-        try {
-          execSync(`sqlite3 "${dbPath}" "${sql}"`, { stdio: 'pipe' });
-          console.log('[thunderid] Updated console redirect URI to', runtimeUri);
-        } catch (e) {
-          console.log('[thunderid] sqlite3 redirect URI update skipped:', (e.message || '').split('\n')[0]);
+      const setupUrlFile = path.join(WORK_DIR, '.vercel-setup-url');
+      const setupUrl = fs.existsSync(setupUrlFile)
+        ? fs.readFileSync(setupUrlFile, 'utf8').trim()
+        : 'https://localhost:8090';
+      const registeredUri = `${setupUrl}/console`;
+      const runtimeUri = `${publicUrl}/console`;
+
+      if (registeredUri !== runtimeUri) {
+        // Try to fix the DB so ThunderID accepts the runtime redirect URI natively.
+        let dbFixed = false;
+        if (fs.existsSync(dbPath)) {
+          const sql = `UPDATE OAUTH_INBOUND_PROFILE SET OAUTH_CONFIG = json_set(OAUTH_CONFIG, '$.redirectUris[0]', '${runtimeUri}') WHERE json_extract(OAUTH_CONFIG, '$.clientId') = 'CONSOLE';`;
+          try {
+            execSync(`sqlite3 "${dbPath}" "${sql}"`, { stdio: 'pipe' });
+            console.log('[thunderid] Updated console redirect URI to', runtimeUri);
+            dbFixed = true;
+          } catch (e) {
+            console.log('[thunderid] sqlite3 not available:', (e.message || '').split('\n')[0]);
+          }
+        }
+        if (!dbFixed) {
+          // sqlite3 unavailable — fall back to proxy-level rewriting.
+          registeredConsoleUri = registeredUri;
+          console.log('[thunderid] Proxy will rewrite redirect_uri:', registeredUri, '↔', runtimeUri);
         }
       }
 
@@ -218,31 +236,69 @@ consent:
 }
 
 // ── Proxy ─────────────────────────────────────────────────────────────────────
+// When registeredConsoleUri differs from the runtime URL (old builds), the proxy
+// rewrites redirect_uri in OIDC authorization/token requests so ThunderID sees
+// the URI it has registered, and rewrites localhost in responses back to the
+// public Vercel URL. This is a no-op once build.js registers the correct URI.
 function proxy(req, res) {
-  const opts = {
-    hostname: '127.0.0.1',
-    port: THUNDER_PORT,
-    path: req.url,
-    method: req.method,
-    // Forward the original Host so ThunderID uses the public hostname for redirects.
-    headers: req.headers,
-    rejectUnauthorized: false, // ThunderID uses a self-signed cert on localhost
-  };
-  const upstream = https.request(opts, r => {
-    const headers = { ...r.headers };
-    // Rewrite any Location headers that still reference the internal address.
-    if (headers.location && resolvedPublicUrl) {
-      headers.location = headers.location
-        .replace(/https?:\/\/localhost(?::\d+)?/g, resolvedPublicUrl);
+  // URL-encoded forms of the two URIs (only set when rewriting is needed).
+  const fromEnc = registeredConsoleUri ? encodeURIComponent(`${resolvedPublicUrl}/console`) : null;
+  const toEnc   = registeredConsoleUri ? encodeURIComponent(registeredConsoleUri) : null;
+
+  // Rewrite redirect_uri in GET query strings (e.g. /oauth2/authorize).
+  const reqPath = fromEnc && req.url.includes(fromEnc)
+    ? req.url.split(fromEnc).join(toEnc)
+    : req.url;
+
+  const makeUpstream = (bodyBuf) => {
+    const headers = { ...req.headers };
+    if (bodyBuf !== null) {
+      // We've buffered and potentially rewritten the body; set the correct length.
+      headers['content-length'] = String(bodyBuf.length);
+      delete headers['transfer-encoding'];
     }
-    res.writeHead(r.statusCode, headers);
-    r.pipe(res, { end: true });
-  });
-  upstream.on('error', () => {
-    if (!res.headersSent) res.writeHead(502);
-    res.end('Bad Gateway');
-  });
-  req.pipe(upstream, { end: true });
+    const opts = {
+      hostname: '127.0.0.1',
+      port: THUNDER_PORT,
+      path: reqPath,
+      method: req.method,
+      headers,
+      rejectUnauthorized: false, // ThunderID uses a self-signed cert on localhost
+    };
+    const upstream = https.request(opts, r => {
+      const respHeaders = { ...r.headers };
+      // Rewrite any localhost URLs in Location headers back to the public URL.
+      if (respHeaders.location && resolvedPublicUrl) {
+        respHeaders.location = respHeaders.location
+          .replace(/https?:\/\/localhost(?::\d+)?/g, resolvedPublicUrl);
+      }
+      res.writeHead(r.statusCode, respHeaders);
+      r.pipe(res, { end: true });
+    });
+    upstream.on('error', () => {
+      if (!res.headersSent) res.writeHead(502);
+      res.end('Bad Gateway');
+    });
+    if (bodyBuf !== null) {
+      upstream.write(bodyBuf);
+      upstream.end();
+    } else {
+      req.pipe(upstream, { end: true });
+    }
+  };
+
+  // Buffer POST bodies to /oauth2/token so we can rewrite redirect_uri there too.
+  if (req.method === 'POST' && fromEnc && req.url.startsWith('/oauth2/token')) {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      let body = Buffer.concat(chunks).toString('utf8');
+      if (body.includes(fromEnc)) body = body.split(fromEnc).join(toEnc);
+      makeUpstream(Buffer.from(body, 'utf8'));
+    });
+  } else {
+    makeUpstream(null);
+  }
 }
 
 // ── Vercel handler ────────────────────────────────────────────────────────────

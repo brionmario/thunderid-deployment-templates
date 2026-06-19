@@ -217,6 +217,12 @@ async function main() {
   try { execSync('fuser -k 8090/tcp 2>/dev/null', { stdio: 'pipe' }); } catch {}
   try { execSync('fuser -k 9090/tcp 2>/dev/null', { stdio: 'pipe' }); } catch {}
 
+  // Record which PUBLIC_URL was used for setup so server.js can detect redirect URI
+  // mismatches at runtime and enable proxy rewriting when needed.
+  const setupUrlRecorded = setupPublicUrl || 'https://localhost:8090';
+  fs.writeFileSync(path.join(OUT_DIR, '.vercel-setup-url'), setupUrlRecorded);
+  console.log(`Setup URL recorded: ${setupUrlRecorded}`);
+
   // Restore placeholder template — server.js fills the actual URL at cold-start
   fs.writeFileSync(path.join(OUT_DIR, 'deployment.yaml'), DEPLOYMENT_YAML);
   console.log(`ThunderID ${tag} ready in thunderid-bin/ (databases pre-initialized)`);
