@@ -171,9 +171,12 @@ async function main() {
       // Replace each: done < <(echo "$BODY" | grep -o '...')
       // With:         done < /tmp/_thunder_psub
       src = src.replace(/done < <\(echo "\$BODY"[^)]+\)/g, 'done < /tmp/_thunder_psub');
-      // Insert temp-file population before each matching while loop
+      // Insert temp-file population before each matching while loop.
+      // The `|| true` is critical: grep exits 1 when no matches found, which
+      // would kill the script under `set -e`. The original process substitution
+      // returned an empty stream silently; we must replicate that behaviour.
       src = src.replace(/while IFS= read -r line; do/g,
-        'echo "$BODY" | grep -o \'{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}\' > /tmp/_thunder_psub\nwhile IFS= read -r line; do');
+        'echo "$BODY" | grep -o \'{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}\' > /tmp/_thunder_psub || true\nwhile IFS= read -r line; do');
       fs.writeFileSync(bootstrapScript, src);
       console.log('Patched 01-default-resources.sh (replaced process substitution with temp files)');
     }
