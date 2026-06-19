@@ -190,6 +190,16 @@ async function main() {
     .replace('hostname: "0.0.0.0"', 'hostname: "localhost"');
   fs.writeFileSync(path.join(OUT_DIR, 'deployment.yaml'), setupYaml);
 
+  // PUBLIC_URL tells setup.sh what URL to register for the Console app's redirect URI.
+  // VERCEL_PROJECT_PRODUCTION_URL is set at Vercel build time to the project's canonical URL.
+  // Without it (local dev) we fall back to the internal HTTPS address setup.sh derives itself.
+  const setupPublicUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL
+    ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+    : '';
+  if (setupPublicUrl) {
+    console.log(`Using PUBLIC_URL for setup: ${setupPublicUrl}`);
+  }
+
   execSync('bash setup.sh', {
     cwd: OUT_DIR,
     stdio: 'inherit',
@@ -198,6 +208,7 @@ async function main() {
       ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'admin',
       ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin',
       THUNDER_SKIP_SECURITY: 'true',
+      ...(setupPublicUrl ? { PUBLIC_URL: setupPublicUrl } : {}),
     },
   });
 

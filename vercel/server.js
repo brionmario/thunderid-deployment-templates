@@ -8,17 +8,15 @@
  *   1. Copy thunderid-bin/ (bundled at build time, pre-initialized) to /tmp/thunderid/
  *   2. Resolve public URL from Vercel env vars
  *   3. Write repository/conf/deployment.yaml with runtime URL, CORS, and TLS config
- *   4. Update console app redirect URI in configdb.db (sqlite3)
+ *   4. Update console app redirect URI in configdb.db (sqlite3, if available)
  *   5. Patch apps/console/config.js and apps/gate/config.js with public hostname
  *   6. Spawn `bash start.sh --without-consent` in the background
  *   7. Poll until port 8090 accepts connections
  *
- * While starting up, every incoming request gets a lightweight "warming up" page
- * that auto-refreshes every 5 seconds so the cold start can finish without hitting
- * Vercel's function timeout.
+ * Requests that arrive while ThunderID is starting wait inline (async) until
+ * it is ready, then get proxied. No loading-page redirect loop.
  */
 
-const http = require('http');
 const https = require('https');
 const net = require('net');
 const { spawn, execSync } = require('child_process');
@@ -46,6 +44,7 @@ function makeExecutable(dir) {
 // ── State ─────────────────────────────────────────────────────────────────────
 let status = 'idle'; // idle | starting | ready | failed
 let startError = '';
+let resolvedPublicUrl = '';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function isPortOpen(port) {
@@ -95,6 +94,7 @@ function boot() {
         }
       }
       const publicHost = publicUrl.replace(/^https?:\/\//, '').replace(/[:/].*/, '');
+      resolvedPublicUrl = publicUrl;
       console.log('[thunderid] Public URL:', publicUrl);
 
       // 3. Write repository/conf/deployment.yaml — ThunderID reads THIS file at startup,
@@ -224,11 +224,18 @@ function proxy(req, res) {
     port: THUNDER_PORT,
     path: req.url,
     method: req.method,
-    headers: { ...req.headers, host: `localhost:${THUNDER_PORT}` },
+    // Forward the original Host so ThunderID uses the public hostname for redirects.
+    headers: req.headers,
     rejectUnauthorized: false, // ThunderID uses a self-signed cert on localhost
   };
   const upstream = https.request(opts, r => {
-    res.writeHead(r.statusCode, r.headers);
+    const headers = { ...r.headers };
+    // Rewrite any Location headers that still reference the internal address.
+    if (headers.location && resolvedPublicUrl) {
+      headers.location = headers.location
+        .replace(/https?:\/\/localhost(?::\d+)?/g, resolvedPublicUrl);
+    }
+    res.writeHead(r.statusCode, headers);
     r.pipe(res, { end: true });
   });
   upstream.on('error', () => {
@@ -238,36 +245,20 @@ function proxy(req, res) {
   req.pipe(upstream, { end: true });
 }
 
-// ── Loading page ──────────────────────────────────────────────────────────────
-const LOADING_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta http-equiv="refresh" content="5">
-<title>ThunderID — Starting…</title>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#05213F;color:#fff;font-family:system-ui,sans-serif;
-       display:flex;align-items:center;justify-content:center;min-height:100vh}
-  .card{text-align:center;padding:2rem}
-  .bolt{font-size:4rem;display:inline-block;animation:pulse 1.2s ease-in-out infinite}
-  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(.9)}}
-  h2{margin:.75rem 0 .5rem;font-size:1.5rem}
-  p{color:#9ab;font-size:.9rem}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="bolt">⚡</div>
-  <h2>ThunderID is starting up…</h2>
-  <p>First start takes 1–2 minutes. This page refreshes automatically.</p>
-</div>
-</body>
-</html>`;
-
 // ── Vercel handler ────────────────────────────────────────────────────────────
-module.exports = (req, res) => {
+// Async so we can wait inline for ThunderID to finish starting instead of
+// returning a 503 loading page (which spawns extra cold-start containers).
+module.exports = async (req, res) => {
   if (status === 'idle') boot();
+
+  // Wait up to 90 s for ThunderID to become ready. ThunderID typically starts
+  // in ~6 s; 90 s gives plenty of headroom without hitting the 300 s limit.
+  if (status === 'starting') {
+    const deadline = Date.now() + 90000;
+    while (status === 'starting' && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 250));
+    }
+  }
 
   if (status === 'ready') {
     proxy(req, res);
@@ -280,7 +271,14 @@ module.exports = (req, res) => {
     return;
   }
 
-  // starting — return auto-refresh loading page
-  res.writeHead(503, { 'Content-Type': 'text/html', 'Retry-After': '5' });
-  res.end(LOADING_HTML);
+  // Timed out waiting (should be rare) — give the browser a plain retry page.
+  res.writeHead(503, { 'Content-Type': 'text/html', 'Retry-After': '10' });
+  res.end(`<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="10">
+<title>ThunderID — Starting…</title>
+<style>body{background:#05213F;color:#fff;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.c{text-align:center}.b{font-size:4rem;animation:p 1.2s ease-in-out infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}h2{margin:.5rem 0}p{color:#9ab}</style>
+</head><body><div class="c"><div class="b">⚡</div>
+<h2>ThunderID is starting…</h2><p>This page refreshes automatically.</p></div></body></html>`);
 };
