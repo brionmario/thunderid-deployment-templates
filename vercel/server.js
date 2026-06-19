@@ -18,6 +18,7 @@
  */
 
 const http = require('http');
+const https = require('https');
 const net = require('net');
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
@@ -145,8 +146,9 @@ function proxy(req, res) {
     path: req.url,
     method: req.method,
     headers: { ...req.headers, host: `localhost:${THUNDER_PORT}` },
+    rejectUnauthorized: false, // ThunderID uses a self-signed cert on localhost
   };
-  const upstream = http.request(opts, r => {
+  const upstream = https.request(opts, r => {
     res.writeHead(r.statusCode, r.headers);
     r.pipe(res, { end: true });
   });
