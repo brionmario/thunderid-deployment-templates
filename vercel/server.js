@@ -28,6 +28,17 @@ const BIN_SRC = path.join(__dirname, 'thunderid-bin');
 const WORK_DIR = '/tmp/thunderid';
 const THUNDER_PORT = 8090;
 
+function makeExecutable(dir) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      makeExecutable(full);
+    } else if (entry.isFile() && (entry.name === 'thunderid' || entry.name.endsWith('.sh'))) {
+      fs.chmodSync(full, 0o755);
+    }
+  }
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 // Persists within a warm Lambda container across requests.
 let status = 'idle'; // idle | starting | ready | failed
@@ -66,11 +77,7 @@ function boot() {
         console.log('[thunderid] Copying binary to /tmp...');
         fs.mkdirSync(WORK_DIR, { recursive: true });
         execSync(`cp -r "${BIN_SRC}/." "${WORK_DIR}"`, { stdio: 'inherit' });
-        // Vercel may strip execute bits during bundling — restore them.
-        execSync(`find "${WORK_DIR}" -type f \\( -name "*.sh" -o -name "thunderid" \\) -exec chmod +x {} +`, { stdio: 'pipe' });
-        if (fs.existsSync(path.join(WORK_DIR, 'bootstrap'))) {
-          execSync(`chmod -R +x "${WORK_DIR}/bootstrap"`, { stdio: 'pipe' });
-        }
+        makeExecutable(WORK_DIR);
       }
 
       // 2. Resolve public URL from Vercel env vars.
