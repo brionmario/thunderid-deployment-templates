@@ -39,6 +39,29 @@ function makeExecutable(dir) {
   }
 }
 
+// Vercel's Lambda environment lacks /dev/fd, so bash process substitution (<(...)) fails.
+// Replace every `done < <(echo "$BODY" | grep -o '...')` with a temp-file equivalent.
+function patchBootstrapScript(workDir) {
+  const scriptPath = path.join(workDir, 'bootstrap', '01-default-resources.sh');
+  if (!fs.existsSync(scriptPath)) return;
+
+  const PSUB_PATTERN = `done < <(echo "$BODY" | grep -o '{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}')`;
+  const WHILE_PATTERN = 'while IFS= read -r line; do';
+
+  let script = fs.readFileSync(scriptPath, 'utf8');
+  if (!script.includes(PSUB_PATTERN)) return; // already patched or different version
+
+  // Replace process substitution on done line with temp file read
+  script = script.split(PSUB_PATTERN).join('done < /tmp/_thunder_psub');
+
+  // Insert temp file population before each matching while loop
+  const EXTRACT = `echo "$BODY" | grep -o '{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}' > /tmp/_thunder_psub\n`;
+  script = script.split(WHILE_PATTERN).join(EXTRACT + WHILE_PATTERN);
+
+  fs.writeFileSync(scriptPath, script);
+  console.log('[thunderid] Patched bootstrap/01-default-resources.sh for Lambda compatibility');
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 // Persists within a warm Lambda container across requests.
 let status = 'idle'; // idle | starting | ready | failed
@@ -78,6 +101,7 @@ function boot() {
         fs.mkdirSync(WORK_DIR, { recursive: true });
         execSync(`cp -r "${BIN_SRC}/." "${WORK_DIR}"`, { stdio: 'inherit' });
         makeExecutable(WORK_DIR);
+        patchBootstrapScript(WORK_DIR);
       }
 
       // 2. Resolve public URL from Vercel env vars.
