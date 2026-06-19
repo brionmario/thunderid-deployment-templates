@@ -217,11 +217,30 @@ async function main() {
   try { execSync('fuser -k 8090/tcp 2>/dev/null', { stdio: 'pipe' }); } catch {}
   try { execSync('fuser -k 9090/tcp 2>/dev/null', { stdio: 'pipe' }); } catch {}
 
-  // Record which PUBLIC_URL was used for setup so server.js can detect redirect URI
-  // mismatches at runtime and enable proxy rewriting when needed.
-  const setupUrlRecorded = setupPublicUrl || 'https://localhost:8090';
-  fs.writeFileSync(path.join(OUT_DIR, '.vercel-setup-url'), setupUrlRecorded);
-  console.log(`Setup URL recorded: ${setupUrlRecorded}`);
+  // setup.sh always registers https://localhost:8090/console because it reads
+  // repository/conf/deployment.yaml (the binary's default TLS+localhost config),
+  // not our root deployment.yaml or the PUBLIC_URL env var.
+  //
+  // Fix: patch the database directly at build time (build containers have sqlite3).
+  // .vercel-setup-url records what's actually in the DB so server.js knows whether
+  // proxy rewriting is needed at cold-start.
+  let setupUrlActual = 'https://localhost:8090';
+  if (setupPublicUrl) {
+    const dbPath = path.join(OUT_DIR, 'repository', 'database', 'configdb.db');
+    const runtimeUri = `${setupPublicUrl}/console`;
+    const sql = `UPDATE OAUTH_INBOUND_PROFILE SET OAUTH_CONFIG = json_set(OAUTH_CONFIG, '$.redirectUris[0]', '${runtimeUri}') WHERE json_extract(OAUTH_CONFIG, '$.clientId') = 'CONSOLE';`;
+    try {
+      execSync(`sqlite3 "${dbPath}" "${sql}"`, { stdio: 'pipe' });
+      console.log(`Updated console redirect URI in database to ${runtimeUri}`);
+      setupUrlActual = setupPublicUrl;
+    } catch (e) {
+      console.log('sqlite3 not available at build time:', (e.message || '').split('\n')[0]);
+      console.log('server.js will handle redirect URI rewriting at cold-start.');
+    }
+  }
+
+  fs.writeFileSync(path.join(OUT_DIR, '.vercel-setup-url'), setupUrlActual);
+  console.log(`Setup URL recorded: ${setupUrlActual}`);
 
   // Restore placeholder template — server.js fills the actual URL at cold-start
   fs.writeFileSync(path.join(OUT_DIR, 'deployment.yaml'), DEPLOYMENT_YAML);
