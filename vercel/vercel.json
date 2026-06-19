@@ -1,3 +1,17 @@
 {
-  "version": 2
+  "version": 2,
+  "buildCommand": "node build.js",
+  "builds": [
+    {
+      "src": "server.js",
+      "use": "@vercel/node",
+      "config": {
+        "includeFiles": ["thunderid-bin/**"],
+        "maxDuration": 300
+      }
+    }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "/server.js" }
+  ]
 }
