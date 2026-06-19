@@ -5,11 +5,10 @@
  * Vercel serverless handler for ThunderID.
  *
  * Cold-start flow (once per Lambda container):
- *   1. Copy thunderid-bin/ (bundled at build time) to /tmp/thunderid/
+ *   1. Copy thunderid-bin/ (bundled at build time, pre-initialized) to /tmp/thunderid/
  *   2. Fill deployment.yaml placeholders from Vercel env vars
- *   3. Run setup.sh to initialise the database and admin account
- *   4. Start the thunderid binary in the background
- *   5. Poll until port 8090 is accepting connections
+ *   3. Start the thunderid binary in the background
+ *   4. Poll until port 8090 is accepting connections
  *
  * While starting up, every request gets a lightweight "warming up" page that
  * auto-refreshes every 5 seconds — so the Vercel function timeout never blocks
@@ -37,29 +36,6 @@ function makeExecutable(dir) {
       fs.chmodSync(full, 0o755);
     }
   }
-}
-
-// Vercel's Lambda environment lacks /dev/fd, so bash process substitution (<(...)) fails.
-// Replace every `done < <(echo "$BODY" | grep -o '...')` with a temp-file equivalent.
-function patchBootstrapScript(workDir) {
-  const scriptPath = path.join(workDir, 'bootstrap', '01-default-resources.sh');
-  if (!fs.existsSync(scriptPath)) return;
-
-  const PSUB_PATTERN = `done < <(echo "$BODY" | grep -o '{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}')`;
-  const WHILE_PATTERN = 'while IFS= read -r line; do';
-
-  let script = fs.readFileSync(scriptPath, 'utf8');
-  if (!script.includes(PSUB_PATTERN)) return; // already patched or different version
-
-  // Replace process substitution on done line with temp file read
-  script = script.split(PSUB_PATTERN).join('done < /tmp/_thunder_psub');
-
-  // Insert temp file population before each matching while loop
-  const EXTRACT = `echo "$BODY" | grep -o '{[^}]*"id":"[^"]*"[^}]*"handle":"[^"]*"[^}]*}' > /tmp/_thunder_psub\n`;
-  script = script.split(WHILE_PATTERN).join(EXTRACT + WHILE_PATTERN);
-
-  fs.writeFileSync(scriptPath, script);
-  console.log('[thunderid] Patched bootstrap/01-default-resources.sh for Lambda compatibility');
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -101,7 +77,6 @@ function boot() {
         fs.mkdirSync(WORK_DIR, { recursive: true });
         execSync(`cp -r "${BIN_SRC}/." "${WORK_DIR}"`, { stdio: 'inherit' });
         makeExecutable(WORK_DIR);
-        patchBootstrapScript(WORK_DIR);
       }
 
       // 2. Resolve public URL from Vercel env vars.
@@ -139,37 +114,7 @@ function boot() {
         }
       }
 
-      // 5. Run setup (temporarily bind to localhost so setup.sh's health-check curl works).
-      console.log('[thunderid] Running setup...');
-      yaml = fs.readFileSync(yamlPath, 'utf8');
-      fs.writeFileSync(yamlPath, yaml.replace('hostname: "0.0.0.0"', 'hostname: "localhost"'));
-
-      try {
-        const setupOut = execSync('bash setup.sh', {
-          cwd: WORK_DIR,
-          stdio: 'pipe',
-          env: {
-            ...process.env,
-            ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'admin',
-            ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin',
-            THUNDER_SKIP_SECURITY: 'true',
-          },
-        });
-        process.stdout.write(setupOut.toString());
-      } catch (setupErr) {
-        const out = (setupErr.stdout || Buffer.alloc(0)).toString().trim();
-        const err = (setupErr.stderr || Buffer.alloc(0)).toString().trim();
-        throw new Error(`setup.sh failed\n\n${err || out}`);
-      }
-
-      // Restore 0.0.0.0 and kill anything setup.sh left running.
-      yaml = fs.readFileSync(yamlPath, 'utf8');
-      fs.writeFileSync(yamlPath, yaml.replace('hostname: "localhost"', 'hostname: "0.0.0.0"'));
-      try { execSync(`lsof -ti tcp:${THUNDER_PORT} | xargs kill -9`, { stdio: 'pipe' }); } catch {}
-      try { execSync('lsof -ti tcp:9090 | xargs kill -9', { stdio: 'pipe' }); } catch {}
-      await new Promise(r => setTimeout(r, 1000));
-
-      // 6. Start the server.
+      // 5. Start the server (databases already initialized at build time).
       console.log('[thunderid] Starting server...');
       const proc = spawn('bash', ['start.sh', '--without-consent'], {
         cwd: WORK_DIR,
@@ -181,7 +126,7 @@ function boot() {
       proc.stderr.on('data', d => process.stderr.write(`[thunderid] ${d}`));
       proc.unref();
 
-      // 7. Poll until ready.
+      // 6. Poll until ready.
       await pollUntilReady(THUNDER_PORT);
       console.log('[thunderid] Ready ✓');
     } catch (err) {

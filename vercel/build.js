@@ -145,7 +145,35 @@ async function main() {
   }
 
   fs.unlinkSync(zipPath);
-  console.log(`ThunderID ${tag} ready in thunderid-bin/`);
+
+  // Run setup at build time so the function only needs to start the server.
+  // The Vercel build machine is full Linux — bash process substitution works fine here.
+  console.log('Running ThunderID setup (build-time)...');
+  const setupYaml = DEPLOYMENT_YAML
+    .replace(/__PUBLIC_URL__/g, 'http://localhost:8090')
+    .replace(/__PUBLIC_HOST__/g, 'localhost')
+    .replace('hostname: "0.0.0.0"', 'hostname: "localhost"');
+  fs.writeFileSync(path.join(OUT_DIR, 'deployment.yaml'), setupYaml);
+
+  execSync('bash setup.sh', {
+    cwd: OUT_DIR,
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'admin',
+      ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin',
+      THUNDER_SKIP_SECURITY: 'true',
+    },
+  });
+
+  // Kill any process setup.sh left running
+  try { execSync('pkill -f thunderid', { stdio: 'pipe' }); } catch {}
+  try { execSync('fuser -k 8090/tcp 2>/dev/null', { stdio: 'pipe' }); } catch {}
+  try { execSync('fuser -k 9090/tcp 2>/dev/null', { stdio: 'pipe' }); } catch {}
+
+  // Restore placeholder template — server.js fills the actual URL at cold-start
+  fs.writeFileSync(path.join(OUT_DIR, 'deployment.yaml'), DEPLOYMENT_YAML);
+  console.log(`ThunderID ${tag} ready in thunderid-bin/ (databases pre-initialized)`);
 }
 
 main().catch(err => { console.error(err); process.exit(1); });
