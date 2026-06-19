@@ -2,7 +2,7 @@
 
 Deploy [ThunderID](https://thunderid.dev) — the high-performance open-source identity stack — to Vercel using Docker.
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/thunder-id/thunderid-vercel)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/brionmario/thunderid-deployment-templates&root=vercel)
 
 ---
 
@@ -26,8 +26,8 @@ Click the button above. Vercel will clone this repo and walk you through environ
 ### Option B — CLI deploy
 
 ```bash
-git clone https://github.com/thunder-id/thunderid-vercel
-cd thunderid-vercel
+git clone https://github.com/brionmario/thunderid-deployment-templates
+cd thunderid-deployment-templates/vercel
 vercel --prod
 ```
 

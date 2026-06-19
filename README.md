@@ -6,7 +6,7 @@ Ready-to-deploy templates for self-hosting [ThunderID](https://thunderid.dev) on
 
 | Template | Platform | |
 |---|---|---|
-| [`vercel/`](./vercel/) | Vercel | [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/thunder-id/thunderid-deployment-templates&root=vercel) |
+| [`vercel/`](./vercel/) | Vercel | [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/brionmario/thunderid-deployment-templates&root=vercel) |
 
 ## License
 
