@@ -66,7 +66,11 @@ function boot() {
         console.log('[thunderid] Copying binary to /tmp...');
         fs.mkdirSync(WORK_DIR, { recursive: true });
         execSync(`cp -r "${BIN_SRC}/." "${WORK_DIR}"`, { stdio: 'inherit' });
-        execSync(`chmod +x "${WORK_DIR}/thunderid" "${WORK_DIR}/setup.sh" "${WORK_DIR}/start.sh"`, { stdio: 'pipe' });
+        // Vercel may strip execute bits during bundling — restore them.
+        execSync(`find "${WORK_DIR}" -type f \\( -name "*.sh" -o -name "thunderid" \\) -exec chmod +x {} +`, { stdio: 'pipe' });
+        if (fs.existsSync(path.join(WORK_DIR, 'bootstrap'))) {
+          execSync(`chmod -R +x "${WORK_DIR}/bootstrap"`, { stdio: 'pipe' });
+        }
       }
 
       // 2. Resolve public URL from Vercel env vars.
@@ -109,16 +113,23 @@ function boot() {
       yaml = fs.readFileSync(yamlPath, 'utf8');
       fs.writeFileSync(yamlPath, yaml.replace('hostname: "0.0.0.0"', 'hostname: "localhost"'));
 
-      execSync('bash setup.sh', {
-        cwd: WORK_DIR,
-        stdio: 'inherit',
-        env: {
-          ...process.env,
-          ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'admin',
-          ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin',
-          THUNDER_SKIP_SECURITY: 'true',
-        },
-      });
+      try {
+        const setupOut = execSync('bash setup.sh', {
+          cwd: WORK_DIR,
+          stdio: 'pipe',
+          env: {
+            ...process.env,
+            ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'admin',
+            ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin',
+            THUNDER_SKIP_SECURITY: 'true',
+          },
+        });
+        process.stdout.write(setupOut.toString());
+      } catch (setupErr) {
+        const out = (setupErr.stdout || Buffer.alloc(0)).toString().trim();
+        const err = (setupErr.stderr || Buffer.alloc(0)).toString().trim();
+        throw new Error(`setup.sh failed\n\n${err || out}`);
+      }
 
       // Restore 0.0.0.0 and kill anything setup.sh left running.
       yaml = fs.readFileSync(yamlPath, 'utf8');
