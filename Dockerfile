@@ -16,41 +16,18 @@
 # under the License.
 # ----------------------------------------------------------------------------
 
-FROM alpine:3.19
+FROM ghcr.io/thunder-id/thunderid:latest
 
-RUN apk add --no-cache sqlite openssl ca-certificates bash curl unzip lsof
-
-# Download the ThunderID release.
-# Pass --build-arg THUNDER_VERSION=x.y.z to pin a version; omit to pull latest automatically.
-ARG THUNDER_VERSION
-
-RUN set -eux; \
-    if [ -z "$THUNDER_VERSION" ]; then \
-        THUNDER_VERSION=$(curl -sf https://brionmario.github.io/thunderid/data/releases.json \
-            | grep -o '"tagName":"v[^"]*"' | head -1 | sed 's/.*"v//;s/"//'); \
-    fi; \
-    ASSET="thunderid-${THUNDER_VERSION}-linux-x64.zip"; \
-    curl -fsSL -o /tmp/thunder.zip \
-        "https://github.com/thunder-id/thunderid/releases/download/v${THUNDER_VERSION}/${ASSET}"; \
-    mkdir -p /app; \
-    cd /tmp && unzip thunder.zip; \
-    cp -r thunderid-*/* /app/; \
-    rm -rf /tmp/thunder.zip /tmp/thunderid-*
-
-WORKDIR /app
+USER root
 
 # Replace the bundled deployment.yaml with a cloud-ready template.
 # Placeholders are substituted at runtime by entrypoint.sh using Vercel env vars.
-COPY .thunderdeploy/deployment.yaml deployment.yaml
+COPY .thunderdeploy/deployment.yaml /opt/thunderid/deployment.yaml
 
 COPY .thunderdeploy/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-RUN addgroup -S thunderid && adduser -S thunderid -G thunderid \
-    && chown -R thunderid:thunderid /app
+RUN chmod +x /entrypoint.sh \
+    && chown thunderid:thunderid /opt/thunderid/deployment.yaml
 
 USER thunderid
-
-EXPOSE 8090
 
 ENTRYPOINT ["/entrypoint.sh"]

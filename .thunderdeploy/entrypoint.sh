@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+cd /opt/thunderid
+
 # ── Resolve public URL ────────────────────────────────────────────────────────
 # Vercel injects VERCEL_PROJECT_PRODUCTION_URL for the stable production domain
 # and VERCEL_URL for the per-deployment preview URL (both without a scheme).

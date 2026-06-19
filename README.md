@@ -8,7 +8,7 @@ Deploy [ThunderID](https://thunderid.dev) — the high-performance open-source i
 
 ## How it works
 
-This repo contains a `Dockerfile` that downloads the latest ThunderID release at build time and an entrypoint script that configures it from Vercel's injected environment variables before starting the server.
+This repo extends the official `ghcr.io/thunder-id/thunderid` Docker image with a thin entrypoint script that configures ThunderID from Vercel's injected environment variables before starting the server.
 
 Vercel terminates TLS at the edge, so ThunderID runs in HTTP-only mode internally and the frontend apps are patched at startup to reach the server through the resolved public domain.
 
@@ -42,21 +42,6 @@ Set these in the Vercel dashboard under **Settings → Environment Variables** b
 | `PUBLIC_URL` | No | auto-detected | Override the public URL (e.g. `https://auth.example.com`) if you use a custom domain |
 
 > **Vercel auto-sets `VERCEL_PROJECT_PRODUCTION_URL` and `PORT`** — the entrypoint reads these automatically, so you do not need to set them.
-
-## Pinning a ThunderID version
-
-The Dockerfile fetches the latest release by default. To pin a specific version pass it as a build argument in `vercel.json`:
-
-```json
-{
-  "version": 2,
-  "build": {
-    "env": {
-      "THUNDER_VERSION": "0.44.0"
-    }
-  }
-}
-```
 
 ## Important limitations
 
@@ -93,7 +78,7 @@ Open [http://localhost:8090](http://localhost:8090) once setup completes.
 
 | Path | Purpose |
 |---|---|
-| `Dockerfile` | Downloads the ThunderID release and sets up the container |
+| `Dockerfile` | Extends `ghcr.io/thunder-id/thunderid` with the Vercel entrypoint |
 | `.thunderdeploy/deployment.yaml` | Server config template; placeholders are filled by the entrypoint |
 | `.thunderdeploy/entrypoint.sh` | Startup script — resolves Vercel env vars, runs setup, starts the server |
 | `vercel.json` | Minimal Vercel project config |
