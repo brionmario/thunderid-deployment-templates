@@ -7,8 +7,10 @@
  * Cold-start flow (once per Lambda container):
  *   1. Copy thunderid-bin/ (bundled at build time, pre-initialized) to /tmp/thunderid/
  *   2. Resolve public URL from Vercel env vars
- *   3. Write repository/conf/deployment.yaml with runtime URL, CORS, and TLS config
- *   4. Update console app redirect URI in configdb.db (sqlite3, if available)
+ *   3. Write repository/conf/deployment.yaml with runtime URL, CORS, TLS config,
+ *      and database config (PostgreSQL/Supabase when SUPABASE_HOST+SUPABASE_PASSWORD
+ *      are set; otherwise bundled SQLite)
+ *   4. SQLite only: update console app redirect URI in configdb.db (sqlite3, if available)
  *   5. Patch apps/console/config.js and apps/gate/config.js with public hostname
  *   6. Spawn `bash start.sh --without-consent` in the background
  *   7. Poll until port 8090 accepts connections
@@ -29,6 +31,90 @@ const THUNDER_PORT = 8090;
 
 // ThunderID reads this path for its runtime config (not the root deployment.yaml).
 const REPO_CONF = path.join(WORK_DIR, 'repository', 'conf', 'deployment.yaml');
+
+// ── PostgreSQL / Supabase runtime detection ────────────────────────────────────
+// Set DATABASE_URL to a full PostgreSQL connection string (preferred — supports the
+// Supabase connection pooler which resolves to IPv4).
+// Alternatively set individual SUPABASE_* env vars.
+function parsePgConfig() {
+  if (process.env.DATABASE_URL) {
+    const raw = process.env.DATABASE_URL;
+    const u = new URL(raw.replace(/^postgres:\/\//, 'postgresql://'));
+    return {
+      host:     u.hostname,
+      port:     parseInt(u.port || '5432', 10),
+      database: u.pathname.replace(/^\//, '') || 'postgres',
+      user:     decodeURIComponent(u.username),
+      password: decodeURIComponent(u.password),
+      sslMode:  'require',
+    };
+  }
+  return {
+    host:     process.env.SUPABASE_HOST     || '',
+    port:     parseInt(process.env.SUPABASE_PORT || '5432', 10),
+    database: process.env.SUPABASE_DB       || 'postgres',
+    user:     process.env.SUPABASE_USER     || 'postgres',
+    password: process.env.SUPABASE_PASSWORD || '',
+    sslMode:  process.env.SUPABASE_SSL_MODE || 'require',
+  };
+}
+
+const pgCfg         = parsePgConfig();
+const USE_SUPABASE  = !!(pgCfg.host && pgCfg.password);
+const SUPABASE_HOST = pgCfg.host;
+const SUPABASE_PORT = pgCfg.port;
+const SUPABASE_DB   = pgCfg.database;
+const SUPABASE_USER = pgCfg.user;
+const SUPABASE_PASSWORD = pgCfg.password;
+const SUPABASE_SSL_MODE = pgCfg.sslMode;
+
+// Auto-switch from Supabase direct host (IPv6-only) to the connection pooler (IPv4).
+// Identical logic to build.js — any regional pooler routes connections via username.
+async function resolveEffectivePostgres(host, user) {
+  const { resolve4 } = require('dns').promises;
+  try {
+    await resolve4(host);
+    return { yamlHost: host, user };
+  } catch {}
+
+  const match = host.match(/^db\.([a-z0-9]+)\.supabase\.co$/i);
+  if (!match) return { yamlHost: host, user };
+
+  const ref = match[1];
+  const poolerUser = (user === 'postgres' || !user.includes('.')) ? `postgres.${ref}` : user;
+  const regions = [
+    'us-east-1', 'ap-southeast-1', 'ap-south-1', 'eu-west-1', 'us-west-1',
+    'ap-northeast-1', 'eu-central-1', 'sa-east-1', 'ap-southeast-2',
+  ];
+  for (const region of regions) {
+    for (const prefix of ['aws-0', 'aws-1']) {
+      const poolerHost = `${prefix}-${region}.pooler.supabase.com`;
+      try {
+        await resolve4(poolerHost);
+        console.log(`[thunderid] Direct host is IPv6-only — auto-using pooler ${poolerHost} (user: ${poolerUser})`);
+        return { yamlHost: poolerHost, user: poolerUser };
+      } catch {}
+    }
+  }
+  return { yamlHost: host, user };
+}
+
+function postgresBlock(host, port, dbName, user, password, sslMode) {
+  return `type: "postgres"
+    postgres:
+      hostname: "${host}"
+      port: ${port}
+      name: "${dbName}"
+      username: "${user}"
+      password: "${password}"
+      sslmode: "${sslMode}"
+      max_open_conns: 5
+      max_idle_conns: 2
+      conn_max_lifetime: 3600
+      max_retries: 3
+      min_retry_backoff_ms: 50
+      max_retry_backoff_ms: 2000`;
+}
 
 function makeExecutable(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -100,20 +186,23 @@ function boot() {
       resolvedPublicUrl = publicUrl;
       console.log('[thunderid] Public URL:', publicUrl);
 
-      // 3. Write repository/conf/deployment.yaml — ThunderID reads THIS file at startup,
-      //    not the root deployment.yaml. We overwrite it with the runtime public URL,
-      //    CORS, and passkey settings while preserving TLS cert paths.
-      const repoConfYaml = `server:
-  hostname: "localhost"
-  port: ${THUNDER_PORT}
-  public_url: "${publicUrl}"
-
-tls:
-  min_version: "1.3"
-  cert_file: "repository/resources/security/server.cert"
-  key_file: "repository/resources/security/server.key"
-
-database:
+      // 3. Write repository/conf/deployment.yaml — ThunderID reads THIS file at startup.
+      //    Database config depends on whether Supabase env vars are set.
+      let dbSection;
+      if (USE_SUPABASE) {
+        const { yamlHost: pgHost, user: pgUser } =
+          await resolveEffectivePostgres(SUPABASE_HOST, SUPABASE_USER);
+        const pg = postgresBlock(pgHost, SUPABASE_PORT, SUPABASE_DB, pgUser, SUPABASE_PASSWORD, SUPABASE_SSL_MODE);
+        dbSection = `database:
+  config:
+    ${pg}
+  runtime:
+    ${pg}
+  user:
+    ${pg}`;
+        console.log(`[thunderid] Using Supabase (PostgreSQL) at ${pgHost}:${SUPABASE_PORT}`);
+      } else {
+        dbSection = `database:
   config:
     type: "sqlite"
     sqlite:
@@ -137,7 +226,20 @@ database:
       options: "_journal_mode=WAL&_busy_timeout=5000&_pragma=foreign_keys(1)"
       max_open_conns: 500
       max_idle_conns: 100
-      conn_max_lifetime: 3600
+      conn_max_lifetime: 3600`;
+      }
+
+      const repoConfYaml = `server:
+  hostname: "localhost"
+  port: ${THUNDER_PORT}
+  public_url: "${publicUrl}"
+
+tls:
+  min_version: "1.3"
+  cert_file: "repository/resources/security/server.cert"
+  key_file: "repository/resources/security/server.key"
+
+${dbSection}
 
 crypto:
   encryption:
@@ -166,35 +268,36 @@ consent:
       fs.writeFileSync(REPO_CONF, repoConfYaml);
       console.log('[thunderid] Wrote runtime repository/conf/deployment.yaml');
 
-      // 4. Determine the redirect URI that was registered at build time and update if possible.
-      //    setup.sh registered based on PUBLIC_URL. Old builds used https://localhost:8090;
-      //    new builds (with VERCEL_PROJECT_PRODUCTION_URL) use the Vercel URL directly.
-      //    Read the setup URL from the config file written by build.js, or fall back to localhost.
-      const dbPath = path.join(WORK_DIR, 'repository', 'database', 'configdb.db');
+      // 4. Redirect URI reconciliation.
+      //    With Supabase the redirect URI is stored in the external DB and was registered
+      //    at build time; no local patching is needed.
+      //    With SQLite we may need to patch the bundled configdb.db.
       const setupUrlFile = path.join(WORK_DIR, '.vercel-setup-url');
-      const setupUrl = fs.existsSync(setupUrlFile)
-        ? fs.readFileSync(setupUrlFile, 'utf8').trim()
-        : 'https://localhost:8090';
-      const registeredUri = `${setupUrl}/console`;
       const runtimeUri = `${publicUrl}/console`;
 
-      if (registeredUri !== runtimeUri) {
-        // Try to fix the DB so ThunderID accepts the runtime redirect URI natively.
-        let dbFixed = false;
-        if (fs.existsSync(dbPath)) {
-          const sql = `UPDATE OAUTH_INBOUND_PROFILE SET OAUTH_CONFIG = json_set(OAUTH_CONFIG, '$.redirectUris[0]', '${runtimeUri}') WHERE json_extract(OAUTH_CONFIG, '$.clientId') = 'CONSOLE';`;
-          try {
-            execSync(`sqlite3 "${dbPath}" "${sql}"`, { stdio: 'pipe' });
-            console.log('[thunderid] Updated console redirect URI to', runtimeUri);
-            dbFixed = true;
-          } catch (e) {
-            console.log('[thunderid] sqlite3 not available:', (e.message || '').split('\n')[0]);
+      if (!USE_SUPABASE) {
+        const dbPath = path.join(WORK_DIR, 'repository', 'database', 'configdb.db');
+        const setupUrl = fs.existsSync(setupUrlFile)
+          ? fs.readFileSync(setupUrlFile, 'utf8').trim()
+          : 'https://localhost:8090';
+        const registeredUri = `${setupUrl}/console`;
+
+        if (registeredUri !== runtimeUri) {
+          let dbFixed = false;
+          if (fs.existsSync(dbPath)) {
+            const sql = `UPDATE OAUTH_INBOUND_PROFILE SET OAUTH_CONFIG = json_set(OAUTH_CONFIG, '$.redirectUris[0]', '${runtimeUri}') WHERE json_extract(OAUTH_CONFIG, '$.clientId') = 'CONSOLE';`;
+            try {
+              execSync(`sqlite3 "${dbPath}" "${sql}"`, { stdio: 'pipe' });
+              console.log('[thunderid] Updated console redirect URI to', runtimeUri);
+              dbFixed = true;
+            } catch (e) {
+              console.log('[thunderid] sqlite3 not available:', (e.message || '').split('\n')[0]);
+            }
           }
-        }
-        if (!dbFixed) {
-          // sqlite3 unavailable — fall back to proxy-level rewriting.
-          registeredConsoleUri = registeredUri;
-          console.log('[thunderid] Proxy will rewrite redirect_uri:', registeredUri, '↔', runtimeUri);
+          if (!dbFixed) {
+            registeredConsoleUri = registeredUri;
+            console.log('[thunderid] Proxy will rewrite redirect_uri:', registeredUri, '↔', runtimeUri);
+          }
         }
       }
 
